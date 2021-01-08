@@ -1,200 +1,85 @@
-from ctypes import *
+import config
+from prepoznava import detect_people
+from scipy.spatial import distance as dist
 import cv2
-import time
 import numpy as np
+import argparse
+import imutils
 import os
-import math
-from itertools import combinations
 
-def is_close(p1, p2):
+# construct the argument parse and parse the arguments
+ap = argparse.ArgumentParser()
+ap.add_argument("-i", "--input", type=str, default="",
+                help="path to (optional) input video file")
+ap.add_argument("-o", "--output", type=str, default="",
+                help="path to (optional) output video file")
+ap.add_argument("-d", "--display", type=int, default=1,
+                help="whether or not output frame should be displayed")
+args = vars(ap.parse_args())
 
-    # 1. Izračunamo razdaljo med dvema točkama - daljica
-    # p1, p2 = dve točke iz katerih dobimo razdaljo
-    # dst = Razdalja med dvema točkama v 2d prostoru
+labelsPath = os.path.sep.join([config.YOLOV3_LABELS_PATH])
+labels = open(labelsPath).read().strip().split("\n")
 
-    dst = math.sqrt(p1 + p2) #izračun razdalje med točkama
-    return dst
+weightsPath = os.path.sep.join([config.YOLOV3_WEIGHTS_PATH])
+configPath = os.path.sep.join([config.YOLOV3_CFG_PATH])
 
-def convertBack(x, y, w, h):
-    """
-    # 2. Converts center coordinates to rectangle coordinates
-    :param:
-    x, y = srednja točka okvirja (koordinate)
-    w, h = širina in višina okvirja
+print("Loading YOLO from disk...")
+net = cv2.dnn.readNetFromDarknet(configPath, weightsPath)
 
-    :return:
-    xmin, ymin, xmax, ymax
-    """
-    xmin = int(round(x - (w / 2)))
-    xmax = int(round(x + (w / 2)))
-    ymin = int(round(y - (h / 2)))
-    ymax = int(round(y + (h / 2)))
-    return xmin, ymin, xmax, ymax
+if config.USE_GPU:
+    # set CUDA as the preferable backend and target
+    print("[INFO] setting preferable backend and target to CUDA...")
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
 
+ln = net.getLayerNames()
+ln = [ln[i[0] - 1] for i in net.getUnconnectedOutLayers()]
 
-def cvBoxes(detections, img):
-    """
-    :param:
-    detections = total detections in one frame
-    img = image from detect_image method of darknet
-    :return:
-    img with bounding box
-    """
+print("Accessing video stream...")
+vs = cv2.VideoCapture(args["input"] if args["input"] else 0)
+writer = None
 
-    # 3. Filtering the person class from detections and get bounding box centroid for each person detection
+while True:
+    (grabbed, frame) = vs.read()
+    if not grabbed:
+        break
+    frame = imutils.resize(frame, width=700)
+    results = detect_people(frame, net, ln, personIdx=labels.index("person"))
 
-    if len(detections) > 0:  # At least 1 detection in the image and check detection presence in a frame
-        centroid_dict = dict()  # Function creates a dictionary and calls it centroid_dict
-        objectId = 0  # We inialize a variable called ObjectId and set it to 0
-        for detection in detections:  # In this if statement, we filter all the detections for persons only
-            # Check for the only person name tag
-            name_tag = str(detection[0].decode())  # Coco file has string of all the names
-            if name_tag == 'person':
-                x, y, w, h = detection[2][0], \
-                             detection[2][1], \
-                             detection[2][2], \
-                             detection[2][3]  # Store the center points of the detections
-                xmin, ymin, xmax, ymax = convertBack(float(x), float(y), float(w), float(
-                    h))  # Convert from center coordinates to rectangular coordinates, We use floats to ensure the precision of the BBox
-                # Append center point of bbox for persons detected.
-                centroid_dict[objectId] = (int(x), int(y), xmin, ymin, xmax,
-                                           ymax)  # Create dictionary of tuple with 'objectId' as the index center points and bbox
-                objectId += 1  # Increment the index for each detection
+    violate = set()
 
-        # 3. Check which person bounding box are close to each other
+    if len(results) >= 2:
+        centroids = np.array([r[2] for r in results])
+        D = dist.cdist(centroids, centroids, metric="euclidean")
 
-        red_zone_list = []  # List containing which Object id is in under threshold distance condition.
-        red_line_list = []
-        for (id1, p1), (id2, p2) in combinations(centroid_dict.items(),
-                                                 2):  # Get all the combinations of close detections, #List of multiple items - id1 1, points 2, 1,3
-            dx, dy = p1[0] - p2[0], p1[1] - p2[1]  # Check the difference between centroid x: 0, y :1
-            distance = is_close(dx, dy)  # Calculates the Euclidean distance
-            if distance < 75.0:  # Set our social distance threshold - If they meet this condition then..
-                if id1 not in red_zone_list:
-                    red_zone_list.append(id1)  # Add Id to a list
-                    red_line_list.append(p1[0:2])  # Add points to the list
-                if id2 not in red_zone_list:
-                    red_zone_list.append(id2)  # Same for the second id
-                    red_line_list.append(p2[0:2])
+        for i in range(0, D.shape[0]):
+            for j in range(i + 1, D.shape[1]):
+                if D[i, j] < config.MIN_DISTANCE:
+                    violate.add(i)
+                    violate.add(j)
+    for (i, (prob, bbox, centroid)) in enumerate(results):
+        (startX, startY, endX, endY) = bbox
+        (cX, cY) = centroid
+        color = (0, 255, 0)
 
-        for idx, box in centroid_dict.items():  # dict (1(key):red(value), 2 blue)  idx - key  box - value
-            if idx in red_zone_list:  # if id is in red zone list
-                cv2.rectangle(img, (box[2], box[3]), (box[4], box[5]), (255, 0, 0),
-                              2)  # Create Red bounding boxes  #starting point, ending point size of 2
-            else:
-                cv2.rectangle(img, (box[2], box[3]), (box[4], box[5]), (0, 255, 0), 2)  # Create Green bounding boxes
+        if i in violate:
+            color = (0, 0, 255)
+        cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
+        cv2.circle(frame, (cX, cY), 5, color, 1)
 
-        # 3. Display risk analytics and risk indicators
+    text = "Preblizu skupi: {}".format(len(violate))
+    cv2.putText(frame, text, (10, frame.shape[0] - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 3)
 
-        text = "No of at-risk people: %s" % str(len(red_zone_list))  # Count People at Risk
-        location = (10, 25)  # Set the location of the displayed text
-        cv2.putText(img, text, location, cv2.FONT_HERSHEY_SIMPLEX, 1, (246, 86, 86), 2, cv2.LINE_AA)  # Display Text
+    if args["display"] > 0:
+        cv2.imshow("Frame", frame)
+        key = cv2.waitKey(1) & 0xFF
 
-        for check in range(0, len(red_line_list) - 1):  # Draw line between nearby bboxes iterate through redlist items
-            start_point = red_line_list[check]
-            end_point = red_line_list[check + 1]
-            check_line_x = abs(end_point[0] - start_point[0])  # Calculate the line coordinates for x
-            check_line_y = abs(end_point[1] - start_point[1])  # Calculate the line coordinates for y
-            if (check_line_x < 75) and (
-                    check_line_y < 25):  # If both are We check that the lines are below our threshold distance.
-                cv2.line(img, start_point, end_point, (255, 0, 0), 2)  # Only above the threshold lines are displayed.
-        # =================================================================#
-    return img
-
-netMain = None
-metaMain = None
-altNames = None
-
-
-def YOLO():
-    """
-    Perform Object detection
-    """
-
-    labelsPath = "./coco.names"
-    LABELS = open(labelsPath).read().strip().split("\n")
-
-    global metaMain, netMain, altNames
-
-    configPath = "./yolov3.cfg"
-    weightsPath = "./yolov3.weights"
-    metaPath = "./coco.names"
-    if not os.path.exists(configPath):
-        raise ValueError("Invalid config path `" +
-                         os.path.abspath(configPath) + "`")
-    if not os.path.exists(weightsPath):
-        raise ValueError("Invalid weight path `" +
-                         os.path.abspath(weightsPath) + "`")
-    if not os.path.exists(metaPath):
-        raise ValueError("Invalid data file path `" +
-                         os.path.abspath(metaPath) + "`")
-    if netMain is None:
-        netMain = cv2.dnn.readNetFromDarknet(configPath, weightsPath)
-    if metaMain is None:
-        metaMain = darknet.load_meta(metaPath.encode("ascii"))
-    if altNames is None:
-        try:
-            with open(metaPath) as metaFH:
-                metaContents = metaFH.read()
-                import re
-                match = re.search("names *= *(.*)$", metaContents,
-                                  re.IGNORECASE | re.MULTILINE)
-                if match:
-                    result = match.group(1)
-                else:
-                    result = None
-                try:
-                    if os.path.exists(result):
-                        with open(result) as namesFH:
-                            namesList = namesFH.read().strip().split("\n")
-                            altNames = [x.strip() for x in namesList]
-                except TypeError:
-                    pass
-        except Exception:
-            pass
-    cap = cv2.VideoCapture(0)
-    # Use this if you want to connect your webcam
-    # cap = cv2.VideoCapture("./Input/test2.mp4")
-    frame_width = int(cap.get(3))
-    frame_height = int(cap.get(4))
-    new_height, new_width = frame_height // 2, frame_width // 2
-    # print("Video Reolution: ",(width, height))
-
-    out = cv2.VideoWriter(
-        "./Demo/test2_output.avi", cv2.VideoWriter_fourcc(*"MJPG"), 10.0,
-        (new_width, new_height))
-
-    # print("Starting the YOLO loop...")
-
-    # Create an image we reuse for each detect
-    darknet_image = darknet.make_image(new_width, new_height, 3)
-
-    while True:
-        prev_time = time.time()
-        ret, frame_read = cap.read()
-        # Check if frame present :: 'ret' returns True if frame present, otherwise break the loop.
-        if not ret:
+        if key == ord("q"):  # če je bil pritisnjen q ustavi program
             break
 
-        frame_rgb = cv2.cvtColor(frame_read, cv2.COLOR_BGR2RGB)
-        frame_resized = cv2.resize(frame_rgb,
-                                   (new_width, new_height),
-                                   interpolation=cv2.INTER_LINEAR)
+    if args["output"] != "" and writer is None:
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        writer = cv2.VideoWriter(args["output"], fourcc, 25, (frame.shape[1], frame.shape[0]), True)
 
-        darknet.copy_image_from_bytes(darknet_image, frame_resized.tobytes())
-
-        detections = darknet.detect_image(netMain, metaMain, darknet_image, thresh=0.25)
-        image = cvBoxes(detections, frame_resized)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        print(1 / (time.time() - prev_time))
-        cv2.imshow('Demo', image)
-        cv2.waitKey(3)
-        out.write(image)
-
-    #cap.release()
-    out.release()
-    print("Video Write Completed...")
-
-
-if __name__ == "__main__":
-    YOLO()
+    if writer is not None:
+        writer.write(frame)
